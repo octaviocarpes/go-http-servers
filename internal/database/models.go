@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+type Chirp struct {
+	ID        string
+	Body      string
+	UserID    string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 type User struct {
 	ID        string
 	CreatedAt time.Time

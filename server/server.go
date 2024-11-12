@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 )
@@ -21,7 +22,20 @@ func ResponseWithJson(payload any, status int, responseWriter http.ResponseWrite
 		return
 	}
 
-	responseWriter.WriteHeader(status)
 	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.WriteHeader(status)
 	responseWriter.Write(response)
+}
+
+func DecodeBody[T any](body io.ReadCloser) (T, error) {
+	decoder := json.NewDecoder(body)
+	var payload T
+
+	decodeError := decoder.Decode(&payload)
+
+	if decodeError != nil {
+		return payload, decodeError
+	}
+
+	return payload, nil
 }

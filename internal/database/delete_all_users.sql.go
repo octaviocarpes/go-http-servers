@@ -10,8 +10,7 @@ import (
 )
 
 const deleteAllUsers = `-- name: DeleteAllUsers :exec
-DELETE FROM users WHERE id IN (SELECT id FROM users)
-RETURNING id, created_at, updated_at, email
+DELETE FROM users WHERE id IN (SELECT id FROM users) RETURNING id, created_at, updated_at, email
 `
 
 func (q *Queries) DeleteAllUsers(ctx context.Context) error {

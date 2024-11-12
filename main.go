@@ -76,56 +76,6 @@ func (config *apiConfig) resetMetricsHandler(responseWriter http.ResponseWriter,
 	config.fileserverHits.Swap(0)
 }
 
-func (config *apiConfig) validateChirpHandler(responseWriter http.ResponseWriter, req *http.Request) {
-	const chirpSizeLimit = 140
-
-	type requestBody struct {
-		Body string `json:"body"`
-	}
-
-	decoder := json.NewDecoder(req.Body)
-	reqBody := requestBody{}
-
-	decodeError := decoder.Decode(&reqBody)
-
-	if decodeError != nil {
-		server.SendInternalServerError(decodeError, responseWriter)
-		return
-	}
-
-	if len(reqBody.Body) > chirpSizeLimit {
-		responsePayload := struct {
-			Error string `json:"error"`
-		}{
-			Error: "Chirp is too long",
-		}
-
-		server.ResponseWithJson(responsePayload, http.StatusBadRequest, responseWriter)
-		return
-	}
-
-	responsePhrase := strings.Split(reqBody.Body, " ")
-	lowerCasePhrase := strings.Split(strings.ToLower(reqBody.Body), " ")
-
-	for i := 0; i < len(responsePhrase); i++ {
-		word := lowerCasePhrase[i]
-
-		if utils.IsProfaneWord(word) {
-			responsePhrase[i] = "****"
-		}
-	}
-
-	cleanedBody := strings.Join(responsePhrase, " ")
-
-	responsePayload := struct {
-		CleanedBody string `json:"cleaned_body"`
-	}{
-		CleanedBody: cleanedBody,
-	}
-
-	server.ResponseWithJson(responsePayload, http.StatusOK, responseWriter)
-}
-
 func (config *apiConfig) createUser(responseWriter http.ResponseWriter, req *http.Request) {
 	type createUserBody struct {
 		Email string `json:"email"`
@@ -165,6 +115,135 @@ func (config *apiConfig) createUser(responseWriter http.ResponseWriter, req *htt
 	server.ResponseWithJson(response, http.StatusCreated, responseWriter)
 }
 
+func (config *apiConfig) createChirp(responseWriter http.ResponseWriter, req *http.Request) {
+	type createChirpBody struct {
+		Body   string `json:"body"`
+		UserId string `json:"user_id"`
+	}
+
+	const chirpSizeLimit = 140
+
+	decodedPayload, decodeError := server.DecodeBody[createChirpBody](req.Body)
+
+	if decodeError != nil {
+		server.SendInternalServerError(decodeError, responseWriter)
+		return
+	}
+
+	if len(decodedPayload.Body) > chirpSizeLimit {
+		responsePayload := struct {
+			Error string `json:"error"`
+		}{
+			Error: "Chirp is too long",
+		}
+
+		server.ResponseWithJson(responsePayload, http.StatusBadRequest, responseWriter)
+		return
+	}
+
+	responsePhrase := strings.Split(decodedPayload.Body, " ")
+	lowerCasePhrase := strings.Split(strings.ToLower(decodedPayload.Body), " ")
+
+	for i := 0; i < len(responsePhrase); i++ {
+		word := lowerCasePhrase[i]
+
+		if utils.IsProfaneWord(word) {
+			responsePhrase[i] = "****"
+		}
+	}
+
+	cleanedBody := strings.Join(responsePhrase, " ")
+
+	payload := database.CreateChirpParams{
+		Body:   cleanedBody,
+		UserID: decodedPayload.UserId,
+	}
+
+	chirp, createChirpError := config.db.CreateChirp(req.Context(), payload)
+
+	if createChirpError != nil {
+		server.SendInternalServerError(createChirpError, responseWriter)
+		return
+	}
+
+	responsePayload := struct {
+		Id        string    `json:"id"`
+		Body      string    `json:"body"`
+		UserId    string    `json:"user_id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}{
+		Id:        chirp.ID,
+		Body:      chirp.Body,
+		UserId:    chirp.UserID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+	}
+
+	server.ResponseWithJson(responsePayload, http.StatusCreated, responseWriter)
+}
+
+func (config *apiConfig) listChirps(responseWriter http.ResponseWriter, req *http.Request) {
+	chirps, listChirpsError := config.db.ListChirps(req.Context())
+
+	if listChirpsError != nil {
+		server.SendInternalServerError(listChirpsError, responseWriter)
+		return
+	}
+
+	type chirpResponse struct {
+		ID        string    `json:"id"`
+		Body      string    `json:"body"`
+		UserID    string    `json:"user_id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+
+	response := make([]chirpResponse, len(chirps))
+
+	for i, chirp := range chirps {
+		response[i] = chirpResponse{
+			ID:        chirp.ID,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+		}
+	}
+
+	server.ResponseWithJson(response, http.StatusOK, responseWriter)
+}
+
+func (config *apiConfig) getChirpById(responseWriter http.ResponseWriter, req *http.Request) {
+	id := req.PathValue("id")
+	chirp, getChirpError := config.db.GetChirpByID(req.Context(), id)
+
+	if getChirpError != nil {
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.WriteHeader(http.StatusNotFound)
+		responseWriter.Write([]byte(`{"error": "chirp not found"}`))
+		return
+	}
+
+	type chirpResponse struct {
+		ID        string    `json:"id"`
+		Body      string    `json:"body"`
+		UserID    string    `json:"user_id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+
+	response := chirpResponse{
+		ID:        chirp.ID,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+	}
+
+	server.ResponseWithJson(response, http.StatusOK, responseWriter)
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -190,9 +269,13 @@ func main() {
 	handler := http.StripPrefix("/app", http.FileServer(http.Dir(filepathRoot)))
 
 	mux.Handle("/app/", config.middlewareMetricsInc(handler))
+
 	mux.HandleFunc("GET /api/healthz", config.healthHandler)
-	mux.HandleFunc("POST /api/validate_chirp", config.validateChirpHandler)
 	mux.HandleFunc("POST /api/users", config.createUser)
+	mux.HandleFunc("GET /api/chirps", config.listChirps)
+	mux.HandleFunc("GET /api/chirps/{id}", config.getChirpById)
+	mux.HandleFunc("POST /api/chirps", config.createChirp)
+
 	mux.HandleFunc("GET /admin/metrics", config.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", config.resetMetricsHandler)
 
@@ -205,4 +288,3 @@ func main() {
 
 	log.Fatal(server.ListenAndServe())
 }
-
