@@ -2,16 +2,16 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
-	"log"
 	"net/http"
 )
 
 func SendInternalServerError(payload any, responseWriter http.ResponseWriter) {
-	log.Printf("Error encoding parameters: %v", payload)
 	responseWriter.WriteHeader(http.StatusInternalServerError)
 	responseWriter.Header().Set("Content-Type", "application/json")
-	responseWriter.Write([]byte(`{"error": "Something went wrong"}`))
+	message := fmt.Sprintf(`{"message": "Something went wrong", "error":"%v"}`, payload)
+	responseWriter.Write([]byte(message))
 }
 
 func ResponseWithJson(payload any, status int, responseWriter http.ResponseWriter) {

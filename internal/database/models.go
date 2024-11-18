@@ -5,6 +5,7 @@
 package database
 
 import (
+	"database/sql"
 	"time"
 )
 
@@ -16,9 +17,19 @@ type Chirp struct {
 	UpdatedAt time.Time
 }
 
-type User struct {
-	ID        string
+type RefreshToken struct {
+	Token     string
+	UserID    string
+	RevokedAt sql.NullTime
+	ExpiresAt time.Time
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	Email     string
+}
+
+type User struct {
+	ID             string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	Email          string
+	HashedPassword string
 }

@@ -11,8 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+	auth "github.com/octaviocarpes/go-http-servers/internal/auth"
 	"github.com/octaviocarpes/go-http-servers/internal/database"
 	server "github.com/octaviocarpes/go-http-servers/server"
 	utils "github.com/octaviocarpes/go-http-servers/utils"
@@ -21,6 +23,7 @@ import (
 type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
+	secret         string
 }
 
 func (config *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -78,7 +81,8 @@ func (config *apiConfig) resetMetricsHandler(responseWriter http.ResponseWriter,
 
 func (config *apiConfig) createUser(responseWriter http.ResponseWriter, req *http.Request) {
 	type createUserBody struct {
-		Email string `json:"email"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -91,7 +95,17 @@ func (config *apiConfig) createUser(responseWriter http.ResponseWriter, req *htt
 		return
 	}
 
-	user, createUserError := config.db.CreateUser(req.Context(), payload.Email)
+	hashedPassword, hashError := auth.HashPassword(payload.Password)
+
+	if hashError != nil {
+		server.SendInternalServerError(hashError, responseWriter)
+		return
+	}
+
+	user, createUserError := config.db.CreateUser(req.Context(), database.CreateUserParams{
+		Email:          payload.Email,
+		HashedPassword: hashedPassword,
+	})
 
 	if createUserError != nil {
 		server.SendInternalServerError(createUserError, responseWriter)
@@ -116,9 +130,26 @@ func (config *apiConfig) createUser(responseWriter http.ResponseWriter, req *htt
 }
 
 func (config *apiConfig) createChirp(responseWriter http.ResponseWriter, req *http.Request) {
+	token, getTokenErr := auth.GetBearerToken(req.Header)
+
+	if getTokenErr != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	userUUID, invalidTokenError := auth.ValidateJWT(token, config.secret)
+
+	if invalidTokenError != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
 	type createChirpBody struct {
-		Body   string `json:"body"`
-		UserId string `json:"user_id"`
+		Body string `json:"body"`
 	}
 
 	const chirpSizeLimit = 140
@@ -156,7 +187,7 @@ func (config *apiConfig) createChirp(responseWriter http.ResponseWriter, req *ht
 
 	payload := database.CreateChirpParams{
 		Body:   cleanedBody,
-		UserID: decodedPayload.UserId,
+		UserID: userUUID.String(),
 	}
 
 	chirp, createChirpError := config.db.CreateChirp(req.Context(), payload)
@@ -244,9 +275,169 @@ func (config *apiConfig) getChirpById(responseWriter http.ResponseWriter, req *h
 	server.ResponseWithJson(response, http.StatusOK, responseWriter)
 }
 
+func (config *apiConfig) login(responseWriter http.ResponseWriter, req *http.Request) {
+	type loginBody struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	decodedPayload, decodeError := server.DecodeBody[loginBody](req.Body)
+
+	if decodeError != nil {
+		server.SendInternalServerError(decodeError, responseWriter)
+		return
+	}
+
+	user, getUserError := config.db.GetUserByEmail(req.Context(), decodedPayload.Email)
+
+	if getUserError != nil {
+		server.SendInternalServerError(getUserError, responseWriter)
+		return
+	}
+
+	checkPasswordError := auth.CheckPasswordHash(decodedPayload.Password, user.HashedPassword)
+
+	if checkPasswordError != nil {
+		fmt.Printf("%v", checkPasswordError)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Write([]byte(`{"error": "wrong credentials"}`))
+		return
+	}
+
+	type userResponse struct {
+		ID           string    `json:"id"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+		Email        string    `json:"email"`
+		Token        string    `json:"token"`
+		RefreshToken string    `json:"refresh_token"`
+	}
+
+	userUUID, uuidErr := uuid.Parse(user.ID)
+
+	if uuidErr != nil {
+		server.SendInternalServerError(uuidErr, responseWriter)
+		return
+	}
+
+	expiration := time.Duration(time.Hour * 1)
+
+	token, createTokenErr := auth.MakeJWT(userUUID, config.secret, expiration)
+
+	if createTokenErr != nil {
+		server.SendInternalServerError(createTokenErr, responseWriter)
+		return
+	}
+
+	refreshToken, makeRefreshTokenError := auth.MakeRefreshToken()
+
+	if makeRefreshTokenError != nil {
+		server.SendInternalServerError(makeRefreshTokenError, responseWriter)
+		return
+	}
+
+	createRefreshTokenPaylod := database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().Add(time.Duration(24*time.Hour) * 60),
+	}
+
+	rToken, createRefreshTokenError := config.db.CreateRefreshToken(req.Context(), createRefreshTokenPaylod)
+
+	if createRefreshTokenError != nil {
+		server.SendInternalServerError(createRefreshTokenError, responseWriter)
+		return
+	}
+
+	server.ResponseWithJson(userResponse{
+		ID:           user.ID,
+		Email:        user.Email,
+		CreatedAt:    user.CreatedAt,
+		UpdatedAt:    user.UpdatedAt,
+		Token:        token,
+		RefreshToken: rToken.Token,
+	}, http.StatusOK, responseWriter)
+}
+
+func (config *apiConfig) refreshSession(responseWriter http.ResponseWriter, req *http.Request) {
+	token, getTokenErr := auth.GetBearerToken(req.Header)
+
+	if getTokenErr != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	dbToken, getTokenErr := config.db.GetRefreshToken(req.Context(), token)
+
+	if getTokenErr != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	if dbToken.ExpiresAt.Before(time.Now()) {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	if dbToken.RevokedAt.Valid {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	userId, err := uuid.Parse(dbToken.UserID)
+
+	if err != nil {
+		server.SendInternalServerError(err, responseWriter)
+		return
+	}
+
+	expiration := time.Duration(time.Hour * 1)
+
+	token, createTokenErr := auth.MakeJWT(userId, config.secret, expiration)
+
+	if createTokenErr != nil {
+		server.SendInternalServerError(createTokenErr, responseWriter)
+		return
+	}
+
+	responseWriter.WriteHeader(http.StatusOK)
+	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.Write([]byte(fmt.Sprintf(`{"token": "%v"}`, token)))
+}
+
+func (config *apiConfig) revokeSession(responseWriter http.ResponseWriter, req *http.Request) {
+	token, getTokenErr := auth.GetBearerToken(req.Header)
+
+	if getTokenErr != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	revokeError := config.db.RevokeToken(req.Context(), token)
+
+	if revokeError != nil {
+		server.SendInternalServerError(revokeError, responseWriter)
+		return
+	}
+
+	responseWriter.WriteHeader(http.StatusNoContent)
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
+	jwtSecret := os.Getenv("JWT_SECRET")
 	db, err := sql.Open("postgres", dbURL)
 
 	if err != nil {
@@ -262,6 +453,7 @@ func main() {
 	config := apiConfig{
 		fileserverHits: atomic.Int32{},
 		db:             dbQueries,
+		secret:         jwtSecret,
 	}
 
 	mux := http.NewServeMux()
@@ -275,6 +467,9 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", config.listChirps)
 	mux.HandleFunc("GET /api/chirps/{id}", config.getChirpById)
 	mux.HandleFunc("POST /api/chirps", config.createChirp)
+	mux.HandleFunc("POST /api/login", config.login)
+	mux.HandleFunc("POST /api/refresh", config.refreshSession)
+	mux.HandleFunc("POST /api/revoke", config.revokeSession)
 
 	mux.HandleFunc("GET /admin/metrics", config.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", config.resetMetricsHandler)
