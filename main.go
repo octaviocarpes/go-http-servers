@@ -24,6 +24,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	secret         string
+	polkaKey       string
 }
 
 func (config *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -113,17 +114,19 @@ func (config *apiConfig) createUser(responseWriter http.ResponseWriter, req *htt
 	}
 
 	type createUserResponse struct {
-		ID        string    `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
+		ID          string    `json:"id"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		Email       string    `json:"email"`
+		IsChirpyRed bool      `json:"is_chirpy_red"`
 	}
 
 	response := createUserResponse{
-		ID:        user.ID,
-		Email:     user.Email,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
+		ID:          user.ID,
+		Email:       user.Email,
+		CreatedAt:   user.CreatedAt,
+		UpdatedAt:   user.UpdatedAt,
+		IsChirpyRed: user.IsChirpyRed.Bool,
 	}
 
 	server.ResponseWithJson(response, http.StatusCreated, responseWriter)
@@ -215,7 +218,38 @@ func (config *apiConfig) createChirp(responseWriter http.ResponseWriter, req *ht
 }
 
 func (config *apiConfig) listChirps(responseWriter http.ResponseWriter, req *http.Request) {
-	chirps, listChirpsError := config.db.ListChirps(req.Context())
+	authorID := req.URL.Query().Get("author_id")
+	sort := req.URL.Query().Get("sort")
+
+	var authorParam sql.NullString
+	sortParam := true
+
+	if len(authorID) == 0 {
+		authorParam = sql.NullString{
+			Valid: false,
+		}
+	} else {
+		authorParam = sql.NullString{
+			Valid:  true,
+			String: authorID,
+		}
+	}
+
+	if len(sort) > 0 && (sort != "desc" && sort != "asc") {
+		responseWriter.WriteHeader(http.StatusBadRequest)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "sort param can only be desc or asc"}`))
+		return
+	}
+
+	if sort == "desc" {
+		sortParam = false
+	}
+
+	chirps, listChirpsError := config.db.ListChirps(req.Context(), database.ListChirpsParams{
+		AuthorID: authorParam,
+		Column1:  sortParam,
+	})
 
 	if listChirpsError != nil {
 		server.SendInternalServerError(listChirpsError, responseWriter)
@@ -310,6 +344,7 @@ func (config *apiConfig) login(responseWriter http.ResponseWriter, req *http.Req
 		CreatedAt    time.Time `json:"created_at"`
 		UpdatedAt    time.Time `json:"updated_at"`
 		Email        string    `json:"email"`
+		IsChirpyRed  bool      `json:"is_chirpy_red"`
 		Token        string    `json:"token"`
 		RefreshToken string    `json:"refresh_token"`
 	}
@@ -355,6 +390,7 @@ func (config *apiConfig) login(responseWriter http.ResponseWriter, req *http.Req
 		Email:        user.Email,
 		CreatedAt:    user.CreatedAt,
 		UpdatedAt:    user.UpdatedAt,
+		IsChirpyRed:  user.IsChirpyRed.Bool,
 		Token:        token,
 		RefreshToken: rToken.Token,
 	}, http.StatusOK, responseWriter)
@@ -434,9 +470,186 @@ func (config *apiConfig) revokeSession(responseWriter http.ResponseWriter, req *
 	responseWriter.WriteHeader(http.StatusNoContent)
 }
 
+func (config *apiConfig) updateUser(responseWriter http.ResponseWriter, req *http.Request) {
+	token, getTokenErr := auth.GetBearerToken(req.Header)
+
+	if getTokenErr != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	userUUID, invalidTokenError := auth.ValidateJWT(token, config.secret)
+
+	if invalidTokenError != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	type updateUserBody struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
+	decodedPayload, decodeError := server.DecodeBody[updateUserBody](req.Body)
+
+	if decodeError != nil {
+		server.SendInternalServerError(decodeError, responseWriter)
+		return
+	}
+
+	hashedPassword, hashError := auth.HashPassword(decodedPayload.Password)
+
+	if hashError != nil {
+		server.SendInternalServerError(hashError, responseWriter)
+		return
+	}
+
+	updatedUser, updateUserError := config.db.UpdateUser(req.Context(), database.UpdateUserParams{
+		Email:          decodedPayload.Email,
+		HashedPassword: hashedPassword,
+		ID:             userUUID.String(),
+	})
+
+	if updateUserError != nil {
+		server.SendInternalServerError(updateUserError, responseWriter)
+		return
+	}
+
+	type responseBody struct {
+		Email string `json:"email"`
+	}
+
+	response := responseBody{
+		Email: updatedUser.Email,
+	}
+
+	server.ResponseWithJson(response, http.StatusOK, responseWriter)
+}
+
+func (config *apiConfig) deleteChirp(responseWriter http.ResponseWriter, req *http.Request) {
+	token, getTokenErr := auth.GetBearerToken(req.Header)
+
+	if getTokenErr != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	userUUID, invalidTokenError := auth.ValidateJWT(token, config.secret)
+
+	if invalidTokenError != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	chirpID := req.PathValue("id")
+
+	chirp, getChirpError := config.db.GetChirpByID(req.Context(), chirpID)
+
+	if getChirpError != nil {
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.WriteHeader(http.StatusNotFound)
+		responseWriter.Write([]byte(`{"error": "chirp not found"}`))
+		return
+	}
+
+	if chirp.UserID != userUUID.String() {
+		responseWriter.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	deleteChirpError := config.db.DeleteChirp(req.Context(), database.DeleteChirpParams{
+		ID:     chirpID,
+		UserID: userUUID.String(),
+	})
+
+	if deleteChirpError != nil {
+		server.SendInternalServerError(deleteChirpError, responseWriter)
+		return
+	}
+
+	responseWriter.WriteHeader(http.StatusNoContent)
+}
+
+func (config *apiConfig) polkaWebhooks(responseWriter http.ResponseWriter, req *http.Request) {
+	apiKey, getTokenErr := auth.GetApiKey(req.Header)
+
+	if getTokenErr != nil {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	if apiKey != config.polkaKey {
+		responseWriter.WriteHeader(http.StatusUnauthorized)
+		responseWriter.Header().Set("Content-Type", "application/json")
+		responseWriter.Write([]byte(`{"error": "Unauthorized"}`))
+		return
+	}
+
+	type webhookBody struct {
+		Event string `json:"event"`
+		Data  struct {
+			UserID string `json:"user_id"`
+		} `json:"data"`
+	}
+
+	decodedPayload, decodeError := server.DecodeBody[webhookBody](req.Body)
+
+	if decodeError != nil {
+		server.SendInternalServerError(decodeError, responseWriter)
+		return
+	}
+
+	if decodedPayload.Event != "user.upgraded" {
+		responseWriter.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if decodedPayload.Event == "user.upgraded" {
+
+		_, getUserError := config.db.GetUserByID(req.Context(), decodedPayload.Data.UserID)
+
+		if getUserError != nil {
+
+			if strings.Contains(getUserError.Error(), "no rows in result set") {
+				responseWriter.WriteHeader(http.StatusNotFound)
+				responseWriter.Header().Set("Content-Type", "application/json")
+				responseWriter.Write([]byte(`{"error": "user not found"}`))
+				return
+			}
+
+			server.SendInternalServerError(getUserError, responseWriter)
+			return
+		}
+
+		_, upgradeError := config.db.UpdateChirpyRedUser(req.Context(), database.UpdateChirpyRedUserParams{
+			IsChirpyRed: sql.NullBool{Bool: true, Valid: true},
+			ID:          decodedPayload.Data.UserID,
+		})
+
+		if upgradeError != nil {
+			server.SendInternalServerError(upgradeError, responseWriter)
+			return
+		}
+
+		responseWriter.WriteHeader(http.StatusNoContent)
+		return
+	}
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
+	polkaKey := os.Getenv("POLKA_KEY")
 	jwtSecret := os.Getenv("JWT_SECRET")
 	db, err := sql.Open("postgres", dbURL)
 
@@ -454,6 +667,7 @@ func main() {
 		fileserverHits: atomic.Int32{},
 		db:             dbQueries,
 		secret:         jwtSecret,
+		polkaKey:       polkaKey,
 	}
 
 	mux := http.NewServeMux()
@@ -464,12 +678,15 @@ func main() {
 
 	mux.HandleFunc("GET /api/healthz", config.healthHandler)
 	mux.HandleFunc("POST /api/users", config.createUser)
+	mux.HandleFunc("PUT /api/users", config.updateUser)
 	mux.HandleFunc("GET /api/chirps", config.listChirps)
 	mux.HandleFunc("GET /api/chirps/{id}", config.getChirpById)
+	mux.HandleFunc("DELETE /api/chirps/{id}", config.deleteChirp)
 	mux.HandleFunc("POST /api/chirps", config.createChirp)
 	mux.HandleFunc("POST /api/login", config.login)
 	mux.HandleFunc("POST /api/refresh", config.refreshSession)
 	mux.HandleFunc("POST /api/revoke", config.revokeSession)
+	mux.HandleFunc("POST /api/polka/webhooks", config.polkaWebhooks)
 
 	mux.HandleFunc("GET /admin/metrics", config.metricsHandler)
 	mux.HandleFunc("POST /admin/reset", config.resetMetricsHandler)

@@ -7,15 +7,25 @@ package database
 
 import (
 	"context"
+	"database/sql"
 )
 
 const listChirps = `-- name: ListChirps :many
-SELECT id, body, user_id, created_at, updated_at FROM chirps
-ORDER BY created_at
+SELECT id, body, user_id, created_at, updated_at
+FROM chirps
+WHERE user_id = COALESCE($2, user_id)
+ORDER BY
+    CASE WHEN $1 THEN created_at END ASC,
+    CASE WHEN $1 = FALSE THEN created_at END DESC
 `
 
-func (q *Queries) ListChirps(ctx context.Context) ([]Chirp, error) {
-	rows, err := q.db.QueryContext(ctx, listChirps)
+type ListChirpsParams struct {
+	Column1  interface{}
+	AuthorID sql.NullString
+}
+
+func (q *Queries) ListChirps(ctx context.Context, arg ListChirpsParams) ([]Chirp, error) {
+	rows, err := q.db.QueryContext(ctx, listChirps, arg.Column1, arg.AuthorID)
 	if err != nil {
 		return nil, err
 	}
